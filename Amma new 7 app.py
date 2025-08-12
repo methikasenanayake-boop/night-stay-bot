@@ -1,129 +1,101 @@
-import io
-import os
-
 import streamlit as st
 import pandas as pd
-import openai
+import io
 
-# ————————————————
-# Setup
-# ————————————————
-st.set_page_config(page_title="Night‐Stay Reconciliation + Copilot", layout="wide")
-st.title("📊 Night‐Stay Reconciliation Bot + Copilot Assistant")
+st.set_page_config(page_title="Night‐Stay Reconciliation", layout="wide")
+st.title("📊 Night‐Stay Reconciliation (One Row per Guest)")
 
-# Load OpenAI key from Secrets
-openai.api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
-
-# ————————————————
-# 1) File Upload
-# ————————————————
+# 1. File uploads
 sys_file = st.file_uploader("Upload System Excel (.xlsx)", type="xlsx")
 bkg_file = st.file_uploader("Upload Booking.com Excel (.xlsx)", type="xlsx")
 
-if not (sys_file and bkg_file):
-    st.info("Please upload BOTH System and Booking.com files to proceed.")
-    st.stop()
+if sys_file and bkg_file:
+    # 2. Read Excel files
+    df_sys = pd.read_excel(sys_file, engine="openpyxl")
+    df_bkg = pd.read_excel(bkg_file, engine="openpyxl")
 
-# ————————————————
-# 2) Read & Aggregate
-# ————————————————
-df_sys = pd.read_excel(sys_file, engine="openpyxl")
-df_bkg = pd.read_excel(bkg_file, engine="openpyxl")
+    # 3. Column indices (0-based)
+    sys_name_col   = df_sys.columns[2]   # 3rd col = guest name
+    bkg_name_col   = df_bkg.columns[3]   # 4th col = guest name
+    bkg_arr_col    = df_bkg.columns[4]   # 5th col = arrival/check-in date
+    bkg_nights_col = df_bkg.columns[8]   # 9th col = total nights
 
-# auto‐select by index
-sys_name, bkg_name = df_sys.columns[2], df_bkg.columns[3]
-bkg_arr, bkg_nights = df_bkg.columns[4], df_bkg.columns[8]
+    # 4. Normalize guest names
+    norm = lambda x: str(x).strip().upper()
+    df_sys["_GUEST"] = df_sys[sys_name_col].apply(norm)
+    df_bkg["_GUEST"] = df_bkg[bkg_name_col].apply(norm)
 
-# normalize names
-norm = lambda x: str(x).strip().upper()
-df_sys["_GUEST"] = df_sys[sys_name].apply(norm)
-df_bkg["_GUEST"] = df_bkg[bkg_name].apply(norm)
+    # 5. Compute earliest check-in date per guest
+    df_bkg[bkg_arr_col] = pd.to_datetime(df_bkg[bkg_arr_col], errors="coerce")
+    arrival = (
+        df_bkg
+        .groupby("_GUEST")[bkg_arr_col]
+        .min()
+        .dt.date
+        .reset_index(name="Checking Date")
+    )
 
-# parse and aggregate
-df_bkg[bkg_arr]     = pd.to_datetime(df_bkg[bkg_arr], errors="coerce")
-df_bkg[bkg_nights]  = pd.to_numeric(df_bkg[bkg_nights], errors="coerce").fillna(0)
+    # 6. Count nights per guest in each source
+    sys_cnt = (
+        df_sys
+        .groupby("_GUEST")
+        .size()
+        .reset_index(name="System Night")
+    )
+    df_bkg[bkg_nights_col] = pd.to_numeric(df_bkg[bkg_nights_col], errors="coerce").fillna(0)
+    bkg_cnt = (
+        df_bkg
+        .groupby("_GUEST")[bkg_nights_col]
+        .sum()
+        .reset_index(name="Booking Night")
+    )
 
-sys_agg = df_sys.groupby("_GUEST").size().rename("System Nights").reset_index()
-bkg_agg = (
-    df_bkg
-    .groupby("_GUEST")
-    .agg(**{
-        "Booking Nights": (bkg_nights, "sum"),
-        "Arrival Date":   (bkg_arr, "min")
-    })
-    .reset_index()
-)
-report = (
-    sys_agg.merge(bkg_agg, on="_GUEST", how="outer")
-    .fillna({"System Nights": 0, "Booking Nights": 0})
-)
-report["System Nights"]  = report["System Nights"].astype(int)
-report["Booking Nights"] = report["Booking Nights"].astype(int)
-report["Arrival Date"]   = report["Arrival Date"].dt.date
-report["Δ Nights"]       = report["Booking Nights"] - report["System Nights"]
-report["Status"]         = report["Δ Nights"].map(lambda d: "Match" if d==0 else ("Booking > System" if d>0 else "System > Booking"))
-report = report.rename(columns={"_GUEST":"Guest"})
-report = report[["Guest","Arrival Date","System Nights","Booking Nights","Δ Nights","Status"]]
+    # 7. Merge into one row per guest
+    report = (
+        sys_cnt
+        .merge(bkg_cnt, on="_GUEST", how="outer")
+        .merge(arrival, on="_GUEST", how="outer")
+        .fillna(0)
+    )
 
-# ————————————————
-# 3) Display Reports
-# ————————————————
-col1, col2 = st.columns(2)
-with col1:
-    st.subheader("📋 Full Report")
-    st.dataframe(report, use_container_width=True)
+    # 8. Calculate net difference and status
+    report["System Night"]  = report["System Night"].astype(int)
+    report["Booking Night"] = report["Booking Night"].astype(int)
+    report["Net Night Difference"] = (
+        report["System Night"] - report["Booking Night"]
+    )
+    report["Status"] = report["Net Night Difference"].apply(
+        lambda d: "Match" if d == 0
+        else ("System Extra" if d > 0 else "Booking Extra")
+    )
 
-    # download helper
-    def to_excel(df):
+    # 9. Rename and reorder columns
+    report = report.rename(columns={"_GUEST": "Guest Name"})
+    report = report[
+        [
+            "Guest Name",
+            "Checking Date",
+            "System Night",
+            "Booking Night",
+            "Net Night Difference",
+            "Status",
+        ]
+    ]
+
+    # 10. Display and allow download
+    st.subheader("📋 Reconciliation Report")
+    st.dataframe(report, height=400)
+
+    def to_excel(df: pd.DataFrame) -> bytes:
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="openpyxl") as writer:
             df.to_excel(writer, index=False, sheet_name="Report")
         buf.seek(0)
         return buf.getvalue()
 
-    st.download_button("📥 Download Report", to_excel(report),
-                       "reconciliation_report.xlsx",
-                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-# mismatches & overlaps
-mism = report[report["Status"]!="Match"]
-ovlp = report[(report["System Nights"]>0)&(report["Booking Nights"]>0)]
-with col2:
-    st.subheader("❗ Mismatch Report")
-    st.dataframe(mism, use_container_width=True)
-    st.subheader("🔄 Overlap Report")
-    st.dataframe(ovlp, use_container_width=True)
-
-# ————————————————
-# 4) Copilot Chat Panel
-# ————————————————
-st.sidebar.markdown("## 🤖 Copilot Assistant")
-user_query = st.sidebar.text_input("Ask Copilot about the data…", "")
-
-if user_query:
-    # build a minimal context: column names + top 5 rows
-    context = (
-        "Columns: " + ", ".join(report.columns.tolist()) + "\n"
-        "Top 5 rows:\n" + report.head().to_csv(index=False)
+    st.download_button(
+        "📥 Download Report",
+        data=to_excel(report),
+        file_name="night_stay_reconciliation.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
-    prompt = (
-        "You are a data assistant. "
-        "I have a reconciliation report with these columns and sample rows:\n\n"
-        f"{context}\n\n"
-        f"User question: {user_query}\n\n"
-        "Please answer concisely and refer back to the data where needed."
-    )
-    # call OpenAI
-    try:
-        resp = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=[{"role":"user","content":prompt}],
-            temperature=0.2,
-            max_tokens=300
-        )
-        answer = resp.choices[0].message.content.strip()
-    except Exception as e:
-        answer = f"Error calling Copilot: {e}"
-
-    st.sidebar.markdown("### Copilot’s Answer")
-    st.sidebar.write(answer)
