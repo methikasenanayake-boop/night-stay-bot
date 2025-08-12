@@ -1,105 +1,63 @@
-import pandas as pd
 import streamlit as st
-from io import BytesIO
-from rapidfuzz import process  # optional, only if you want fuzzy matching
+import pandas as pd
+import io
 
-def normalize(name: str) -> str:
-    """
-    Normalize guest names: strip whitespace, lowercase,
-    remove punctuation/diacritics so matching is case-insensitive.
-    """
-    s = str(name).strip().lower()
-    # keep letters, numbers, and spaces only
-    return "".join(ch for ch in s if ch.isalnum() or ch.isspace())
+st.set_page_config(page_title="Guest Night-Stay Reconciliation", layout="wide")
+st.title("Guest Night-Stay Reconciliation Bot")
+st.markdown("Upload your System file and Booking.com file to compare guest night-stay records.")
 
-# ──────────────────────────────────────────────────
-# Streamlit UI
-# ──────────────────────────────────────────────────
-st.set_page_config(page_title="Night‐Stay Reconciliation Bot", layout="wide")
-st.title("📊 Night‐Stay Reconciliation Bot")
+file_system = st.file_uploader("System Excel file", type=["xlsx"])
+file_booking = st.file_uploader("Booking.com Excel file", type=["xlsx"])
 
-st.markdown(
-    """
-    Upload your **System.xlsx** and **Booking.com.xlsx** files below.
-    The app will:
-    1. Normalize guest names (case‐insensitive).
-    2. Count nights per guest in each file.
-    3. Show a full comparison + highlight mismatches.
-    4. Let you download an Excel report with two sheets.
-    """
-)
+if file_system and file_booking:
+    df_system = pd.read_excel(file_system)
+    df_booking = pd.read_excel(file_booking)
 
-col1, col2 = st.columns(2)
-with col1:
-    sys_file = st.file_uploader("Upload System.xlsx", type=["xlsx"])
-with col2:
-    bcom_file = st.file_uploader("Upload Booking.com.xlsx", type=["xlsx"])
+    st.subheader("Data Previews")
+    st.write("System file", df_system.head())
+    st.write("Booking.com file", df_booking.head())
 
-# ──────────────────────────────────────────────────
-# Processing
-# ──────────────────────────────────────────────────
-if sys_file and bcom_file:
-    # Read the first sheet of each workbook
-    df_sys = pd.read_excel(sys_file)
-    df_b   = pd.read_excel(bcom_file)
+    # Adjust these to match your actual column headers
+    key_columns = ["Guest Name", "Month", "Nights"]
 
-    # Normalize names
-    df_sys["_GUEST"] = df_sys["Guest Name"].apply(normalize)
-    df_b  ["_GUEST"] = df_b["Guest Name"].apply(normalize)
+    missing = [c for c in key_columns if c not in df_system.columns or c not in df_booking.columns]
+    if missing:
+        st.error(f"Missing columns in one of the files: {missing}")
+        st.stop()
 
-    # Count nights from System: one row = one night
-    sys_counts = (
-        df_sys
-        .groupby("_GUEST")
-        .size()
-        .reset_index(name="System Nights")
+    merged = df_system.merge(
+        df_booking,
+        on=key_columns,
+        how="outer",
+        indicator=True
     )
 
-    # Sum nights from Booking.com: use the “Room Night” column
-    # (or adjust to your actual “Total of Nights” column name)
-    bcom_counts = (
-        df_b
-        .groupby("_GUEST")["Room Night"]
-        .sum()
-        .reset_index(name="Booking Nights")
-    )
+    matched      = merged[merged["_merge"] == "both"].drop(columns=["_merge"])
+    only_system  = merged[merged["_merge"] == "left_only"].drop(columns=["_merge"])
+    only_booking = merged[merged["_merge"] == "right_only"].drop(columns=["_merge"])
 
-    # Merge, fill missing with 0, compute difference & status
-    merged = (
-        pd.merge(sys_counts, bcom_counts, on="_GUEST", how="outer")
-          .fillna(0)
-    )
-    merged["System Nights"]  = merged["System Nights"].astype(int)
-    merged["Booking Nights"] = merged["Booking Nights"].astype(int)
-    merged["Δ Nights"]       = merged["System Nights"] - merged["Booking Nights"]
-    merged["Status"]         = merged["Δ Nights"].apply(lambda x: "Match" if x == 0 else "Mismatch")
+    st.subheader("Matched Records")
+    st.dataframe(matched)
 
-    # Restore a human-readable guest name column (title‐cased)
-    merged.insert(
-        loc=0,
-        column="Guest",
-        value=merged["_GUEST"].str.upper()  # or .str.title() if you prefer Title Case
-    )
-    merged.drop(columns=["_GUEST"], inplace=True)
+    st.subheader("Only in System file")
+    st.dataframe(only_system)
 
-    # Display
-    st.subheader("🔍 Full Comparison")
-    st.dataframe(merged.style.format({"Δ Nights": "{:+d}"}), height=400)
+    st.subheader("Only in Booking.com file")
+    st.dataframe(only_booking)
 
-    st.subheader("❗ Mismatches Only")
-    df_mismatch = merged.query("Status == 'Mismatch'")
-    st.dataframe(df_mismatch, height=300)
-
-    # Prepare download
-    buffer = BytesIO()
+    # Build Excel download
+    buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        merged.to_excel(writer, sheet_name="Master Comparison", index=False)
-        df_mismatch.to_excel(writer, sheet_name="Mismatches", index=False)
-    buffer.seek(0)
+        matched.to_excel(writer, sheet_name="Matched", index=False)
+        only_system.to_excel(writer, sheet_name="Only_System", index=False)
+        only_booking.to_excel(writer, sheet_name="Only_Booking", index=False)
+    data = buffer.getvalue()
 
     st.download_button(
-        label="📥 Download Reconciliation Report",
-        data=buffer,
+        label="Download Reconciliation Report",
+        data=data,
         file_name="reconciliation_report.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
+
+
